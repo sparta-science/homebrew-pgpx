@@ -1,0 +1,208 @@
+name: release 
+
+on:
+  workflow_dispatch:
+  push:
+    tags: [ "v[0-9]+.[0-9]+.[0-9]+" ]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        arch: [ amd64, arm64 ]
+        os: [ darwin ]
+        product: [ pgpx ]
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Standardize HEAD Reference
+      id: head_ref
+      run: |
+        echo "REF=${{ github.event.pull_request && github.head_ref || github.ref_name }}" >> $GITHUB_ENV
+
+    - name: Define asset name
+      id: asset_name
+      run: |
+        echo "ASSET_NAME=${{ matrix.product }}-${{ matrix.os }}-${{ matrix.arch }}" >> $GITHUB_ENV
+  
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: '1.20'
+
+    - name: Build binary for ${{ matrix.arch }}
+      run: |
+        GOOS=darwin GOARCH=${{ matrix.arch }} go build -o ${{ env.ASSET_NAME }} -ldflags "-X main.versionNumber=${{ env.REF }}" ${{ matrix.product }}.go
+        sha256sum -b ${{ env.ASSET_NAME }} | awk '{ print $1; }' > ${{ env.ASSET_NAME }}.sha256
+
+    - name: Pass ${{ matrix.arch }} binary to release job
+      uses: actions/upload-artifact@v3
+      with:
+        name: ${{ env.ASSET_NAME }}
+        path: ./${{ env.ASSET_NAME }}
+
+    - name: Pass ${{ matrix.arch }} SHA256 to release job
+      uses: actions/upload-artifact@v3
+      with:
+        name: ${{ env.ASSET_NAME }}.sha256
+        path: ./${{ env.ASSET_NAME }}.sha256
+
+  create_release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Standardize HEAD Reference
+      id: head_ref
+      run: |
+        echo "REF=${{ github.event.pull_request && github.head_ref || github.ref_name }}" >> $GITHUB_ENV
+
+    - name: Create release
+      uses: actions/create-release@v1
+      id: create_release
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        draft: false
+        prerelease: false
+        release_name: Release ${{ env.REF }}
+        tag_name: ${{ github.ref }}
+        body_path: CHANGELOG.md
+
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+
+  release_artifacts:
+    needs:
+      - build
+      - create_release
+    strategy:
+      matrix:
+        arch: [ amd64, arm64 ]
+        os: [ darwin ]
+        product: [ pgpx ]
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Define asset name
+      id: asset_name
+      run: |
+        echo "ASSET_NAME=${{ matrix.product }}-${{ matrix.os }}-${{ matrix.arch }}" >> $GITHUB_ENV
+
+    - name: Download ${{ matrix.arch }} binary
+      uses: actions/download-artifact@v3
+      with:
+        name: ${{ env.ASSET_NAME }}
+        path: ./
+
+    - name: Download ${{ matrix.arch }} SHA256 hash
+      uses: actions/download-artifact@v3
+      with:
+        name: ${{ env.ASSET_NAME }}.sha256
+        path: ./
+
+    - name: List files
+      run: |
+        ls -l
+
+    - name: Upload ${{ matrix.arch }} artifact
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ needs.create_release.outputs.upload_url }}
+        asset_path: ./${{ env.ASSET_NAME }}
+        asset_name: ${{ env.ASSET_NAME }}
+        asset_content_type: application/octet-stream
+
+    - name: Upload ${{ matrix.arch }} artifact SHA256 hash
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ needs.create_release.outputs.upload_url }}
+        asset_path: ./${{ env.ASSET_NAME }}.sha256
+        asset_name: ${{ env.ASSET_NAME }}.sha256
+        asset_content_type: text/plain
+
+  update_formula:
+    needs:
+      - build
+      - create_release
+      - release_artifacts
+    strategy:
+      matrix:
+        os: [ darwin ]
+        product: [ pgpx ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Define asset name
+      id: asset_name
+      run: |
+        echo "ASSET_NAME=${{ matrix.product }}-${{ matrix.os }}" >> $GITHUB_ENV
+
+    - name: Standardize HEAD Reference
+      id: head_ref
+      run: |
+        echo "REF=${{ github.event.pull_request && github.head_ref || github.ref_name }}" >> $GITHUB_ENV
+  
+    - name: Download assets (SHA256 hashes)
+      uses: dsaltares/fetch-gh-release-asset@master
+      with:
+        version: 'tags/${{ env.REF }}'
+        regex: true
+        file: "${{ env.ASSET }}-.*\\.sha256"
+        target: "./"
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: List files
+      run: |
+        ls -l
+
+    - name: Update formula file
+      run: |
+        arm_sha=$(cat ./${{ env.ASSET_NAME }}-arm64.sha256)
+        amd_sha=$(cat ./${{ env.ASSET_NAME }}-amd64.sha256)
+        version=$(echo ${{ env.REF }} | sed 's/v//g')
+
+        echo "arm64 sha256: ${arm_sha}"
+        echo "amd64 sha256: ${amd_sha}" 
+        echo "version: ${version}"
+
+        bash ./update_formula.sh $version $arm_sha $amd_sha
+        ls -al Formula/
+        cat Formula/${{ matrix.product }}.rb
+
+    - name: Create Pull Request
+      id: cpr
+      uses: peter-evans/create-pull-request@v5
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        commit-message: Update Homebrew formula version to ${{ env.REF }}
+        committer: GitHub <noreply@github.com>
+        author: ${{ github.actor }} <${{ github.actor }}@users.noreply.github.com>
+        signoff: false
+        base: main
+        branch: releases/${{ env.REF }}
+        delete-branch: true
+        title: 'Update Homebrew formula version to ${{ env.REF }}'
+        body: |
+          Update Homebrew formula version to ${{ env.REF }}
+        labels: |
+          homebrew
+          formula
+        add-paths: |
+          Formula/*.rb
+        # assignees: peter-evans
+        # reviewers: peter-evans
+        # team-reviewers: |
+        #   developers
+        draft: false
